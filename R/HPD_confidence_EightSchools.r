@@ -1,8 +1,7 @@
 library(tidyverse)
 library(fakeMCMC)
 library(boot)
-source("aux_estimation_quality.r")
-source("aux_HPD_estimators.r") ## basically old estimators
+source("aux_HPD_estimators.r")
 ##############################
 ############# Functions
 run_once <- function(i) {
