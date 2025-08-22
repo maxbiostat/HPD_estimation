@@ -41,86 +41,6 @@ def empirical_hpd(data: Float[Array, "n_samples"], alpha: Float[Array, ""]) -> F
     return jnp.array([lower_endpoints[idx], upper_endpoints[idx]])
 
 
-def hpd_z_estimator(
-    alpha: Float[Array, ""],
-    density: Callable[[Float[Array, ""]], Float[Array, ""]],
-    x0: Float[Array, "2"],
-    tol: Float[Array, ""] = 1E-8,
-    maxiter: int = 1000,
-    transformed_density: Callable[[Float[Array, ""]], Float[Array, ""]] = None,
-    phi: Callable[[Float[Array, ""]], Float[Array, ""]] = None,
-) -> Float[Array, "2"]:
-    """Computes the HDP of a unimodal, positive density as a Z-estimator
-    THIS TURNED OUT TO BE WAY SLOWER THAN SCIPY'S ROOTFINDER
-    """
-
-    def find_pair(a):
-        b = a
-        while density(b) >= density(a):
-            b *= 1.1
-        return root_scalar(
-            f = lambda x: density(x) - density(a),
-            method = "bisect",
-            bracket = [a + 1E-10, b]
-        ).root
-
-    if (phi is not None) and (transformed_density is not None):
-        def compute_coverage(a, b):
-            return quad(transformed_density, phi(a), phi(b))[0]
-    else:
-        def compute_coverage(a, b):
-            return quad(density, a, b)[0]
-
-    a0, b0 = x0
-    # find new b0 such that f(a0) = f(b0)
-    b0 = find_pair(a0)
-    density(b0) - density(a0)
-    # compute the coverage of a0, b0
-    coverage = compute_coverage(a0, b0)
-    if coverage > alpha:
-        a1 = a0
-        b1 = b0
-        while compute_coverage(a1, b1) > alpha:
-            a1 *= 1.05
-            b1 = find_pair(a1)
-    elif coverage < alpha:
-        a1 = a0
-        b1 = b0
-        while compute_coverage(a0, b0) < alpha:
-            a0 *= 0.95
-            b0 = find_pair(a0)
-
-    # Now [a0, b0] contains the HPD and [a1, b1] is contained in the HPD
-    # So we apply bisection on the coverage
-    it = 0
-    stop_condition = abs(compute_coverage(a0, b0) - alpha) < tol
-    while (not stop_condition) and (it <= maxiter):
-        it += 1
-        a = (a0 + a1) / 2
-        while density(a + 1E-10) - density(a) <= 0:
-            a = (a0 + a) / 2
-        b = find_pair(a)
-        coverage = compute_coverage(a, b)
-        if coverage < alpha:
-            a1, b1 = a, b
-        if coverage > alpha:
-            a0, b0 = a, b
-        stop_condition = (abs(compute_coverage(a0, b0) - alpha) + abs(density(a0) - density(b0))) < tol
-
-    result = RootFinderResult(x=jnp.array([a0, b0]), success=None, message=None)
-    if stop_condition:
-        result.success = True
-    else:
-        result.sucess = False
-        result.message = "Maximum number of root finder iterations reached"
-
-    ic(a0)
-    ic(b0)
-    ic([compute_coverage(a0, b0) - alpha, density(b0) - density(a0)])
-
-    return result
-    
-    
 def compute_bandwidth(data: Float[Array, ""], method="rule of thumb") -> Float[Array, ""]:
     n = data.shape[0]
     if method == "rule of thumb": # Assumes kernel is gaussian
@@ -272,16 +192,15 @@ if __name__ == "__main__":
     ) -> Float[Array, ""]:
         return jnp.exp(-(jnp.log(x) - MU)**2 / (2 * SIGMA**2)) / (x * SIGMA * jnp.sqrt(2*jnp.pi))
 
-    # true_hpd_sol = root(
-    #     fun=lambda x: jnp.array([quad(log_normal_pdf, x[0], x[1])[0] - ALPHA, log_normal_pdf(x[0]) - log_normal_pdf(x[1])]),
-    #     x0=[0.1, 2.0],
-    #     jac=lambda x: jnp.array([
-    #             [-log_normal_pdf(x[0]), log_normal_pdf(x[1])],
-    #             [jax.grad(log_normal_pdf)(x[0]), -jax.grad(log_normal_pdf)(x[1])]
-    #     ]),
-    #     method="hybr",
-    # )
-    true_hpd_sol = hpd_z_estimator(ALPHA, log_normal_pdf, jnp.array([0.01, 2.0]))
+    true_hpd_sol = root(
+        fun=lambda x: jnp.array([quad(log_normal_pdf, x[0], x[1])[0] - ALPHA, log_normal_pdf(x[0]) - log_normal_pdf(x[1])]),
+        x0=[0.1, 2.0],
+        jac=lambda x: jnp.array([
+                [-log_normal_pdf(x[0]), log_normal_pdf(x[1])],
+                [jax.grad(log_normal_pdf)(x[0]), -jax.grad(log_normal_pdf)(x[1])]
+        ]),
+        method="hybr",
+    )
     print(true_hpd_sol.success)
     print(true_hpd_sol.message)
     print(true_hpd_sol.x)
