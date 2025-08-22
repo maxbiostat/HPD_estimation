@@ -2,6 +2,7 @@ import jax
 import jax.numpy as jnp
 import matplotlib.pyplot as plt
 import numpy as np
+import polars as pl
 from icecream import ic
 from jax import random
 from jax.scipy.optimize import minimize
@@ -11,8 +12,7 @@ from scipy.integrate import quad
 from scipy.optimize import root
 from tqdm import tqdm
     
-# from HPD_estimation_as_Z_estimator_modified import HPD_estimator_with_confidence
-from HPD_estimation_as_multiscale_Z_estimator import HPD_estimator_with_confidence
+from HPD_estimation_as_Z_estimator_modified import HPD_estimator_with_confidence
 
 KERNEL = lambda x: 1/jnp.sqrt(2*jnp.pi)*jnp.exp(-x**2/2)
 PHI = lambda x: jnp.log(x)
@@ -21,7 +21,7 @@ ALPHA = 0.90
 BETA = 0.95
 SIGMA = 1
 MU = 0.0
-N_SAMPLES = int(1E3)
+N_SAMPLES = int(1E4)
 N_REPLICATIONS = int(5E2)
 
 def log_normal_pdf(
@@ -48,19 +48,23 @@ print(b)
 
 if __name__ == "__main__":
     key = random.key(0)
-    coverage = np.empty(shape=(N_REPLICATIONS, 2), dtype=jnp.int32)
-    a_L_less_than_zero = 0
-    for i in tqdm(range(N_REPLICATIONS)):
-        key, _ = random.split(key)
-        data = jnp.exp(MU + SIGMA * random.normal(key=key, shape=(N_SAMPLES,)))
-        hpd_estimator = HPD_estimator_with_confidence(
-            data, ALPHA, BETA, KERNEL, PHI, KERNEL_SQUARED_NORM,
-        )
-        a_hat, a_L, a_U, b_hat, b_L, b_U = hpd_estimator
-        a_L_less_than_zero += (a_L <= 0)
-        coverage[i, 0] = a_L < a < a_U
-        coverage[i, 1] = b_L < b < b_U
-    a_coverage, b_coverage = jnp.mean(coverage, axis=0)
-    print(f"coverage for a: {100*a_coverage:.2f}%")
-    print(f"coverage for b: {100*b_coverage:.2f}%")
-    print(f"% of a_L less than 0: {100*a_L_less_than_zero/N_REPLICATIONS:.2f}%")
+    data = pl.read_csv("python/for_Caio.csv")
+    data = jnp.array(data["x"])
+    print(data.min(), data.max())
+    hpd_estimator = HPD_estimator_with_confidence(
+        data, ALPHA, BETA, KERNEL, PHI, KERNEL_SQUARED_NORM,
+    )
+    a_hat, a_L, a_U, b_hat, b_L, b_U = hpd_estimator
+
+    ic(a_hat, b_hat)
+    print()
+
+    ic(a_L)
+    ic(a)
+    ic(a_U)
+    ic(a_L <= a <= a_U)
+
+    ic(b_L)
+    ic(b)
+    ic(b_U)
+    ic(b_L <= b <= b_U)

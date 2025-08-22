@@ -196,9 +196,10 @@ def HPD_estimator_with_confidence(
     kde_ess = n_samples * bandwidth
     kde = KDE(transformed_data, bandwidth, kernel)
     transformed_kde = TransformedKDE(kde, phi)
+    transformed_kde_deriv = jax.grad(transformed_kde)
     phi_grad = jax.grad(phi)
     normal_dist = Normal(mu=0.0, sigma=1.0)
-    q = normal_dist.icdf((1 + beta)/2)
+    q = normal_dist.icdf((1 + jnp.sqrt(beta))/2)
 
     fun = lambda interval: empirical_Psi(
         interval, kde, phi, transformed_kde, bandwidth, alpha
@@ -223,26 +224,35 @@ def HPD_estimator_with_confidence(
         raise Exception(f"Reached max number of tries: {maxiter}. Root finder did not converge")
     a_hat, b_hat = hpd_sol.x
 
-    transformed_kde_deriv = jax.grad(transformed_kde)
-    gamma_hat_numerator = (
-        kernel_squared_norm * (
-            transformed_kde(a_hat) * phi_grad(a_hat)
-            + transformed_kde(b_hat) * phi_grad(b_hat)
-        )
+    det = (
+        transformed_kde(b_hat) * transformed_kde_deriv(a_hat)
+        - transformed_kde(a_hat) * transformed_kde_deriv(b_hat)
     )
-    gamma_hat_denominator = jnp.square(
-        kde(b_hat) * transformed_kde_deriv(a_hat)
-        - kde(a_hat) * transformed_kde_deriv(b_hat)
+    inv = 1 / det * jnp.array([
+        [transformed_kde_deriv(b_hat), - transformed_kde(b_hat)],
+        [transformed_kde_deriv(a_hat), - transformed_kde(a_hat)]
+    ])
+    gamma = inv @ jnp.sqrt(jnp.array([
+        [alpha * (1 - alpha) / n_samples, 0],
+        [0, kernel_squared_norm * (
+                transformed_kde(a_hat) * phi_grad(a_hat)
+                + transformed_kde(b_hat) * phi_grad(b_hat)
+            ) / kde_ess ]
+    ]))
+
+    vertices = gamma @ jnp.stack(
+        [
+            jnp.array([q, q]),
+            jnp.array([-q, q]),
+            jnp.array([q, -q]),
+            jnp.array([-q, -q])
+        ],
+        axis=1
     )
-    gamma_hat = jnp.sqrt(gamma_hat_numerator / gamma_hat_denominator)
-    a_scale = jnp.min(jnp.array([transformed_kde(b_hat), transformed_kde(a_hat)]))
-    b_scale = jnp.max(jnp.array([transformed_kde(b_hat), transformed_kde(a_hat)]))
-    a_L = a_hat - gamma_hat * a_scale / jnp.sqrt(kde_ess) * q
-    a_U = a_hat + gamma_hat * a_scale / jnp.sqrt(kde_ess) * q
-    # b_L = b_hat - gamma_hat * transformed_kde(a_hat) / jnp.sqrt(kde_ess) * q
-    # b_U = b_hat + gamma_hat * transformed_kde(a_hat) / jnp.sqrt(kde_ess) * q
-    b_L = b_hat - gamma_hat * b_scale / jnp.sqrt(kde_ess) * q
-    b_U = b_hat + gamma_hat * b_scale / jnp.sqrt(kde_ess) * q
+    a_L = a_hat + jnp.min(vertices[0, :])
+    a_U = a_hat + jnp.max(vertices[0, :])
+    b_L = b_hat + jnp.min(vertices[1, :])
+    b_U = b_hat + jnp.max(vertices[1, :])
     return jnp.array([a_hat, a_L, a_U, b_hat, b_L, b_U])
 
 
@@ -255,7 +265,7 @@ if __name__ == "__main__":
     SIGMA = 1
     MU = 0.0
     N_SAMPLES = int(1E4)
-    key = random.key(0)
+    key = random.key(42)
 
     def log_normal_pdf(
         x: Float[Array, ""],
