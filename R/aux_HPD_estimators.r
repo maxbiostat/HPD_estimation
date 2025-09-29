@@ -75,12 +75,14 @@ hpd_intervals_boot <- function(samples,
   
   raw.ci.a <- boot::boot.ci(boot.out = bb, conf = gamma,
                             type = c("norm",
-                                     "perc", "basic"),
+                                     "perc",
+                                     "basic"),
                           index = 1)
   
   raw.ci.b <- boot::boot.ci(boot.out = bb, conf = gamma,
                             type = c("norm",
-                                     "perc", "basic"),
+                                     "perc",
+                                     "basic"),
                             index = 2)
   
     

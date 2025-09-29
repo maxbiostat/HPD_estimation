@@ -8,18 +8,39 @@ golden <- cmdstanr_example(
 )
 
 bf.tau <- golden$draws("tau")
-hist(bf.tau)
-( brute.force.HPD <- HDInterval::hdi(bf.tau) )
 
-Fhat <- ecdf(tau)
+hist(bf.tau, probability = TRUE,
+     main = "",
+     xlab = expression(tau))
 
-Fhat(brute.force.HPD)
+Alphas <- c(.5, .8, .9, .95)
+
+true.HPD <- do.call(rbind,
+                    lapply(Alphas, function(a){
+                      hpd <- HDInterval::hdi(bf.tau, credMass = a)
+                      out <- data.frame(HPD_L = hpd[1],
+                                        HPD_U = hpd[2],
+                                        alpha = a)
+                      return(out)
+                    }))
+rownames(true.HPD) <- NULL
+
+Fhat <- ecdf(bf.tau)
+
+ps <- data.frame(t(apply(true.HPD, 1, function(x) Fhat(x[1:2]))))
+colnames(ps) <- c("p_L", "p_U")
+
+write.csv(cbind(true.HPD, ps),
+          file = "../results/true_HPD_EightSchools.csv",
+          row.names = FALSE)
+
 
 generate_tau_draws <- function(M){
   out <- cmdstanr_example(
     example = c("schools_ncp"),
     method = c("sample"),
-    iter_sampling = M/4,
+    chains = 1,
+    iter_sampling = M,
     quiet = TRUE
   )
   return(out$draws("tau"))
@@ -35,6 +56,6 @@ for(i in 1:Nrep){
 
 
 save(Simus,
-     file = paste0("saved_data/EightSchools_simus",
+     file = paste0("../saved_data/EightSchools_simus",
                    "_M=", M,
                    ".RData" ))
