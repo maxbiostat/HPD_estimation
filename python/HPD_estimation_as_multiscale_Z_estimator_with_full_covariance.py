@@ -16,9 +16,9 @@ from scipy.stats import gaussian_kde
 from scipy.stats import Normal
 
 
-# plt.rcParams.update({
-#     "text.usetex": True,
-# })
+plt.rcParams.update({
+    "text.usetex": True,
+})
 jax.config.update("jax_enable_x64", True)
 
 
@@ -41,86 +41,6 @@ def empirical_hpd(data: Float[Array, "n_samples"], alpha: Float[Array, ""]) -> F
     return jnp.array([lower_endpoints[idx], upper_endpoints[idx]])
 
 
-def hpd_z_estimator(
-    alpha: Float[Array, ""],
-    density: Callable[[Float[Array, ""]], Float[Array, ""]],
-    x0: Float[Array, "2"],
-    tol: Float[Array, ""] = 1E-8,
-    maxiter: int = 1000,
-    transformed_density: Callable[[Float[Array, ""]], Float[Array, ""]] = None,
-    phi: Callable[[Float[Array, ""]], Float[Array, ""]] = None,
-) -> Float[Array, "2"]:
-    """Computes the HDP of a unimodal, positive density as a Z-estimator
-    THIS TURNED OUT TO BE WAY SLOWER THAN SCIPY'S ROOTFINDER
-    """
-
-    def find_pair(a):
-        b = a
-        while density(b) >= density(a):
-            b *= 1.1
-        return root_scalar(
-            f = lambda x: density(x) - density(a),
-            method = "bisect",
-            bracket = [a + 1E-10, b]
-        ).root
-
-    if (phi is not None) and (transformed_density is not None):
-        def compute_coverage(a, b):
-            return quad(transformed_density, phi(a), phi(b))[0]
-    else:
-        def compute_coverage(a, b):
-            return quad(density, a, b)[0]
-
-    a0, b0 = x0
-    # find new b0 such that f(a0) = f(b0)
-    b0 = find_pair(a0)
-    density(b0) - density(a0)
-    # compute the coverage of a0, b0
-    coverage = compute_coverage(a0, b0)
-    if coverage > alpha:
-        a1 = a0
-        b1 = b0
-        while compute_coverage(a1, b1) > alpha:
-            a1 *= 1.05
-            b1 = find_pair(a1)
-    elif coverage < alpha:
-        a1 = a0
-        b1 = b0
-        while compute_coverage(a0, b0) < alpha:
-            a0 *= 0.95
-            b0 = find_pair(a0)
-
-    # Now [a0, b0] contains the HPD and [a1, b1] is contained in the HPD
-    # So we apply bisection on the coverage
-    it = 0
-    stop_condition = abs(compute_coverage(a0, b0) - alpha) < tol
-    while (not stop_condition) and (it <= maxiter):
-        it += 1
-        a = (a0 + a1) / 2
-        while density(a + 1E-10) - density(a) <= 0:
-            a = (a0 + a) / 2
-        b = find_pair(a)
-        coverage = compute_coverage(a, b)
-        if coverage < alpha:
-            a1, b1 = a, b
-        if coverage > alpha:
-            a0, b0 = a, b
-        stop_condition = (abs(compute_coverage(a0, b0) - alpha) + abs(density(a0) - density(b0))) < tol
-
-    result = RootFinderResult(x=jnp.array([a0, b0]), success=None, message=None)
-    if stop_condition:
-        result.success = True
-    else:
-        result.sucess = False
-        result.message = "Maximum number of root finder iterations reached"
-
-    ic(a0)
-    ic(b0)
-    ic([compute_coverage(a0, b0) - alpha, density(b0) - density(a0)])
-
-    return result
-    
-    
 def compute_bandwidth(data: Float[Array, ""], method="rule of thumb") -> Float[Array, ""]:
     n = data.shape[0]
     if method == "rule of thumb": # Assumes kernel is gaussian
@@ -189,6 +109,7 @@ def HPD_estimator_with_confidence(
     kernel_squared_norm: Float[Array, ""],
     x0: Float[Array, "2"] = None,
     maxiter: int = 1000,
+    key: jax.random.PRNGKey = 42,
 ) -> Float[Array, "6"]:
     n_samples = data.shape[0]
     transformed_data = phi(data)
@@ -196,9 +117,10 @@ def HPD_estimator_with_confidence(
     kde_ess = n_samples * bandwidth
     kde = KDE(transformed_data, bandwidth, kernel)
     transformed_kde = TransformedKDE(kde, phi)
+    transformed_kde_deriv = jax.grad(transformed_kde)
     phi_grad = jax.grad(phi)
     normal_dist = Normal(mu=0.0, sigma=1.0)
-    q = normal_dist.icdf((1 + beta)/2)
+    q = normal_dist.icdf((1 + jnp.sqrt(beta))/2)
 
     fun = lambda interval: empirical_Psi(
         interval, kde, phi, transformed_kde, bandwidth, alpha
@@ -210,7 +132,6 @@ def HPD_estimator_with_confidence(
         x0 = empirical_hpd(data, alpha)
     x1 = x0
     hpd_sol = None
-    key = random.key(1234)
     it = 0
     while (hpd_sol is None) and (it <= maxiter):
         it += 1
@@ -223,55 +144,67 @@ def HPD_estimator_with_confidence(
         raise Exception(f"Reached max number of tries: {maxiter}. Root finder did not converge")
     a_hat, b_hat = hpd_sol.x
 
-    transformed_kde_deriv = jax.grad(transformed_kde)
-    gamma_hat_numerator = (
-        kernel_squared_norm * (
-            transformed_kde(a_hat) * phi_grad(a_hat)
-            + transformed_kde(b_hat) * phi_grad(b_hat)
-        )
+    det = (
+        transformed_kde(b_hat) * transformed_kde_deriv(a_hat)
+        - transformed_kde(a_hat) * transformed_kde_deriv(b_hat)
     )
-    gamma_hat_denominator = jnp.square(
-        kde(b_hat) * transformed_kde_deriv(a_hat)
-        - kde(a_hat) * transformed_kde_deriv(b_hat)
+    inv_psi_dot = 1 / det * jnp.array([
+        [transformed_kde_deriv(b_hat), - transformed_kde(b_hat)],
+        [transformed_kde_deriv(a_hat), - transformed_kde(a_hat)]
+    ])
+    inv_R_n = jnp.array([
+        [1/jnp.sqrt(n_samples), 0],
+        [0, 1/jnp.sqrt(kde_ess)]
+    ])
+    root_cov = jnp.linalg.cholesky(jnp.array([
+        [alpha * (1 - alpha), jnp.sqrt(bandwidth)*(transformed_kde(b_hat) - transformed_kde(a_hat))*(1/2 - alpha)],
+        [jnp.sqrt(bandwidth)*(transformed_kde(b_hat) - transformed_kde(a_hat))*(1/2 - alpha),
+         kernel_squared_norm * (transformed_kde(a_hat) * phi_grad(a_hat) + transformed_kde(b_hat) * phi_grad(b_hat)) + 2 * bandwidth * transformed_kde(a_hat) * phi_grad(a_hat) * transformed_kde(b_hat) * phi_grad(b_hat)]
+    ]))
+    gamma = inv_psi_dot @ inv_R_n @ root_cov
+
+    vertices = gamma @ jnp.stack(
+        [
+            jnp.array([q, q]),
+            jnp.array([-q, q]),
+            jnp.array([q, -q]),
+            jnp.array([-q, -q])
+        ],
+        axis=1
     )
-    gamma_hat = jnp.sqrt(gamma_hat_numerator / gamma_hat_denominator)
-    a_scale = jnp.min(jnp.array([transformed_kde(b_hat), transformed_kde(a_hat)]))
-    b_scale = jnp.max(jnp.array([transformed_kde(b_hat), transformed_kde(a_hat)]))
-    a_L = a_hat - gamma_hat * a_scale / jnp.sqrt(kde_ess) * q
-    a_U = a_hat + gamma_hat * a_scale / jnp.sqrt(kde_ess) * q
-    # b_L = b_hat - gamma_hat * transformed_kde(a_hat) / jnp.sqrt(kde_ess) * q
-    # b_U = b_hat + gamma_hat * transformed_kde(a_hat) / jnp.sqrt(kde_ess) * q
-    b_L = b_hat - gamma_hat * b_scale / jnp.sqrt(kde_ess) * q
-    b_U = b_hat + gamma_hat * b_scale / jnp.sqrt(kde_ess) * q
+    a_L = a_hat + jnp.min(vertices[0, :])
+    a_U = a_hat + jnp.max(vertices[0, :])
+    b_L = b_hat + jnp.min(vertices[1, :])
+    b_U = b_hat + jnp.max(vertices[1, :])
     return jnp.array([a_hat, a_L, a_U, b_hat, b_L, b_U])
 
 
 if __name__ == "__main__":
     kernel = lambda x: 1/jnp.sqrt(2*jnp.pi)*jnp.exp(-x**2/2)
     phi = lambda x: jnp.log(x)
+    # phi = lambda x: x
     kernel_squared_norm = 1 / (2*jnp.sqrt(jnp.pi))
     ALPHA = 0.95
     BETA = 0.95
     SIGMA = 1
     MU = 0.0
     N_SAMPLES = int(1E3)
-    key = random.key(0)
+    key = random.key(42)
 
     def log_normal_pdf(
         x: Float[Array, ""],
     ) -> Float[Array, ""]:
         return jnp.exp(-(jnp.log(x) - MU)**2 / (2 * SIGMA**2)) / (x * SIGMA * jnp.sqrt(2*jnp.pi))
 
-    # true_hpd_sol = root(
-    #     fun=lambda x: jnp.array([quad(log_normal_pdf, x[0], x[1])[0] - ALPHA, log_normal_pdf(x[0]) - log_normal_pdf(x[1])]),
-    #     x0=[0.1, 2.0],
-    #     jac=lambda x: jnp.array([
-    #             [-log_normal_pdf(x[0]), log_normal_pdf(x[1])],
-    #             [jax.grad(log_normal_pdf)(x[0]), -jax.grad(log_normal_pdf)(x[1])]
-    #     ]),
-    #     method="hybr",
-    # )
-    true_hpd_sol = hpd_z_estimator(ALPHA, log_normal_pdf, jnp.array([0.01, 2.0]))
+    true_hpd_sol = root(
+        fun=lambda x: jnp.array([quad(log_normal_pdf, x[0], x[1])[0] - ALPHA, log_normal_pdf(x[0]) - log_normal_pdf(x[1])]),
+        x0=[0.1, 2.0],
+        jac=lambda x: jnp.array([
+                [-log_normal_pdf(x[0]), log_normal_pdf(x[1])],
+                [jax.grad(log_normal_pdf)(x[0]), -jax.grad(log_normal_pdf)(x[1])]
+        ]),
+        method="hybr",
+    )
     print(true_hpd_sol.success)
     print(true_hpd_sol.message)
     print(true_hpd_sol.x)
@@ -329,7 +262,10 @@ if __name__ == "__main__":
     plt.show()
 
     fig_, ax = plt.subplots()
-    x = jnp.linspace(0.0, 5.0, num=300)
+    x = jnp.linspace(-1.0, 5.0, num=500)
     ax.plot(x, log_normal_pdf(x), linewidth=1, color="black", label=r"$f(x)$")
     ax.plot(x, jax.vmap(transformed_kde)(x), linewidth=1, color="blue", label=r"$f_n(x)$")
+    # ax.set_title(r"$n = 10^4$")
+    ax.legend()
+    plt.savefig("kde_versus_density.pdf")
     plt.show()

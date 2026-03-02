@@ -1,6 +1,5 @@
-from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Dict
+from typing import Callable, Dict
 
 import jax
 import jax.numpy as jnp
@@ -27,6 +26,15 @@ class RootFinderResult:
     x: Float[Array, "..."]
     success: bool
     message: str | None
+
+@dataclass
+class HPDEstimate:
+    a_hat: float
+    a_L: float
+    a_U: float
+    b_hat: float
+    b_L: float
+    b_U: float
 
 
 def empirical_hpd(data: Float[Array, "n_samples"], alpha: Float[Array, ""]) -> Float[Array, ""]:
@@ -59,15 +67,17 @@ def TransformedKDE(
     kde: Callable[[Float[Array, ""]], Float[Array, ""]],
     phi: Callable[[Float[Array, ""]], Float[Array, ""]],
 ) -> Callable[[Float[Array, "x"]], Float[Array, "x"]]:
+    """
+    kde is an estimate of the density of phi(X) and TransformedKDE is an estimate
+    of the density of X.
+    """
     return lambda x: kde(phi(x)) * jax.grad(phi)(x)
 
 
 def empirical_Psi(
     interval: Float[Array, "2"],
-    kde: Callable[[Float[Array, ""]], Float[Array, ""]],
     phi: Callable[[Float[Array, ""]], Float[Array, ""]],
     transformed_kde: Callable[[Float[Array, ""]], Float[Array, ""]],
-    bandwidth: Float[Array, ""],
     alpha: Float[Array, ""],
 ) -> Float[Array, "2"]:
     a, b = interval[0], interval[1]
@@ -79,11 +89,8 @@ def empirical_Psi(
 
 def jac_empirical_Psi(
     interval: Float[Array, "2"],
-    kde: Callable[[Float[Array, ""]], Float[Array, ""]],
     phi: Callable[[Float[Array, ""]], Float[Array, ""]],
     transformed_kde: Callable[[Float[Array, ""]], Float[Array, ""]],
-    bandwidth: Float[Array, ""],
-    alpha: Float[Array, ""],
 ) -> Float[Array, "2"]:
     a, b = interval[0], interval[1]
     transformed_kde_derivative = jax.grad(transformed_kde)
@@ -109,7 +116,9 @@ def HPD_estimator_with_confidence(
     kernel_squared_norm: Float[Array, ""],
     x0: Float[Array, "2"] = None,
     maxiter: int = 1000,
-) -> Float[Array, "6"]:
+    key: jax.random.PRNGKey = 42,
+    single_rate: bool = False,
+) -> HPDEstimate:
     n_samples = data.shape[0]
     transformed_data = phi(data)
     bandwidth = compute_bandwidth(transformed_data)
@@ -122,16 +131,15 @@ def HPD_estimator_with_confidence(
     q = normal_dist.icdf((1 + jnp.sqrt(beta))/2)
 
     fun = lambda interval: empirical_Psi(
-        interval, kde, phi, transformed_kde, bandwidth, alpha
+        interval, phi, transformed_kde,alpha
     )
     jac = lambda interval: jac_empirical_Psi(
-        interval, kde, phi, transformed_kde, bandwidth, alpha
+        interval, phi, transformed_kde
     )
     if x0 is None:
         x0 = empirical_hpd(data, alpha)
     x1 = x0
     hpd_sol = None
-    key = random.key(1234)
     it = 0
     while (hpd_sol is None) and (it <= maxiter):
         it += 1
@@ -139,48 +147,64 @@ def HPD_estimator_with_confidence(
         if not hpd_sol.success :
             hpd_sol = None
             key, _ = random.split(key)
-            x1 = x0 + jnp.array([jnp.sqrt(0.1), 1]) * random.normal(key, (2))
+            x1 = x0 + jnp.array([jnp.quantile(data, (1 - alpha)/2), jnp.quantile(data, (1 + alpha)/2)]) * random.normal(key, (2))
     if hpd_sol is None:
         raise Exception(f"Reached max number of tries: {maxiter}. Root finder did not converge")
     a_hat, b_hat = hpd_sol.x
 
-    det = (
-        transformed_kde(b_hat) * transformed_kde_deriv(a_hat)
-        - transformed_kde(a_hat) * transformed_kde_deriv(b_hat)
-    )
-    inv = 1 / det * jnp.array([
-        [transformed_kde_deriv(b_hat), - transformed_kde(b_hat)],
-        [transformed_kde_deriv(a_hat), - transformed_kde(a_hat)]
-    ])
-    gamma = inv @ jnp.sqrt(jnp.array([
-        [alpha * (1 - alpha) / n_samples, 0],
-        [0, kernel_squared_norm * (
-                transformed_kde(a_hat) * phi_grad(a_hat)
-                + transformed_kde(b_hat) * phi_grad(b_hat)
-            ) / kde_ess ]
-    ]))
+    if single_rate:
+        q = normal_dist.icdf((1 + beta)/2)
+        std_err = (
+            transformed_kde(a_hat) * jnp.sqrt(
+                (kernel_squared_norm * (transformed_kde(a_hat) * phi_grad(a_hat) + transformed_kde(b_hat) * phi_grad(b_hat)))
+                / (transformed_kde(b_hat) * transformed_kde_deriv(a_hat) - transformed_kde(a_hat) * transformed_kde_deriv(b_hat))**2
+            )
+        ) / jnp.sqrt(kde_ess)
+        a_L = a_hat - std_err * q
+        a_U = a_hat + std_err * q
+        b_L = b_hat - std_err * q
+        b_U = b_hat + std_err * q
+    else:
+        det = (
+            transformed_kde(b_hat) * transformed_kde_deriv(a_hat)
+            - transformed_kde(a_hat) * transformed_kde_deriv(b_hat)
+        )
+        inv_psi_dot = 1 / det * jnp.array([
+            [transformed_kde_deriv(b_hat), - transformed_kde(b_hat)],
+            [transformed_kde_deriv(a_hat), - transformed_kde(a_hat)]
+        ])
+        inv_R_n = jnp.array([
+            [1/jnp.sqrt(n_samples), 0],
+            [0, 1/jnp.sqrt(kde_ess)]
+        ])
+        root_cov = jnp.sqrt(jnp.array([
+            [alpha * (1 - alpha), 0],
+            [0, kernel_squared_norm * (transformed_kde(a_hat) * phi_grad(a_hat) + transformed_kde(b_hat) * phi_grad(b_hat))]
+        ]))
+        gamma = inv_psi_dot @ inv_R_n @ root_cov
 
-    vertices = gamma @ jnp.stack(
-        [
-            jnp.array([q, q]),
-            jnp.array([-q, q]),
-            jnp.array([q, -q]),
-            jnp.array([-q, -q])
-        ],
-        axis=1
-    )
-    a_L = a_hat + jnp.min(vertices[0, :])
-    a_U = a_hat + jnp.max(vertices[0, :])
-    b_L = b_hat + jnp.min(vertices[1, :])
-    b_U = b_hat + jnp.max(vertices[1, :])
-    return jnp.array([a_hat, a_L, a_U, b_hat, b_L, b_U])
+        vertices = gamma @ jnp.stack(
+            [
+                jnp.array([q, q]),
+                jnp.array([-q, q]),
+                jnp.array([q, -q]),
+                jnp.array([-q, -q])
+            ],
+            axis=1
+        )
+        a_L = a_hat + jnp.min(vertices[0, :])
+        a_U = a_hat + jnp.max(vertices[0, :])
+        b_L = b_hat + jnp.min(vertices[1, :])
+        b_U = b_hat + jnp.max(vertices[1, :])
+    # return jnp.array([a_hat, a_L, a_U, b_hat, b_L, b_U])
+    return HPDEstimate(a_hat, a_L, a_U, b_hat, b_L, b_U)
 
 
 if __name__ == "__main__":
     kernel = lambda x: 1/jnp.sqrt(2*jnp.pi)*jnp.exp(-x**2/2)
     phi = lambda x: jnp.log(x)
     kernel_squared_norm = 1 / (2*jnp.sqrt(jnp.pi))
-    ALPHA = 0.9
+    ALPHA = 0.95
     BETA = 0.95
     SIGMA = 1
     MU = 0.0
@@ -220,8 +244,13 @@ if __name__ == "__main__":
     hpd_estimator = HPD_estimator_with_confidence(
         data, ALPHA, BETA, kernel, phi, kernel_squared_norm
     )
-    a_hat, a_L, a_U, b_hat, b_L, b_U = hpd_estimator
-    ic(empirical_Psi([a_hat, b_hat], kde, phi, transformed_kde, bandwidth, ALPHA))
+    a_hat = hpd_estimator.a_hat
+    a_L = hpd_estimator.a_L
+    a_U = hpd_estimator.a_U
+    b_hat = hpd_estimator.b_hat
+    b_L = hpd_estimator.b_L
+    b_U = hpd_estimator.b_U
+    ic(empirical_Psi([a_hat, b_hat], phi, transformed_kde, ALPHA))
     ic(a_hat)
     ic(a_L)
     ic(a_U)

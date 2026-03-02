@@ -20,7 +20,7 @@ from scipy.stats import Normal
 #     "text.usetex": True,
 # })
 jax.config.update("jax_enable_x64", True)
-
+normal_dist = Normal(mu=0.0, sigma=1.0)
 
 @dataclass
 class RootFinderResult:
@@ -41,89 +41,11 @@ def empirical_hpd(data: Float[Array, "n_samples"], alpha: Float[Array, ""]) -> F
     return jnp.array([lower_endpoints[idx], upper_endpoints[idx]])
 
 
-def hpd_z_estimator(
-    alpha: Float[Array, ""],
-    density: Callable[[Float[Array, ""]], Float[Array, ""]],
-    x0: Float[Array, "2"],
-    tol: Float[Array, ""] = 1E-8,
-    maxiter: int = 1000,
-    transformed_density: Callable[[Float[Array, ""]], Float[Array, ""]] = None,
-    phi: Callable[[Float[Array, ""]], Float[Array, ""]] = None,
-) -> Float[Array, "2"]:
-    """Computes the HDP of a unimodal, positive density as a Z-estimator
-    THIS TURNED OUT TO BE WAY SLOWER THAN SCIPY'S ROOTFINDER
-    """
-
-    def find_pair(a):
-        b = a
-        while density(b) >= density(a):
-            b *= 1.1
-        return root_scalar(
-            f = lambda x: density(x) - density(a),
-            method = "bisect",
-            bracket = [a + 1E-10, b]
-        ).root
-
-    if (phi is not None) and (transformed_density is not None):
-        def compute_coverage(a, b):
-            return quad(transformed_density, phi(a), phi(b))[0]
-    else:
-        def compute_coverage(a, b):
-            return quad(density, a, b)[0]
-
-    a0, b0 = x0
-    # find new b0 such that f(a0) = f(b0)
-    b0 = find_pair(a0)
-    density(b0) - density(a0)
-    # compute the coverage of a0, b0
-    coverage = compute_coverage(a0, b0)
-    if coverage > alpha:
-        a1 = a0
-        b1 = b0
-        while compute_coverage(a1, b1) > alpha:
-            a1 *= 1.05
-            b1 = find_pair(a1)
-    elif coverage < alpha:
-        a1 = a0
-        b1 = b0
-        while compute_coverage(a0, b0) < alpha:
-            a0 *= 0.95
-            b0 = find_pair(a0)
-
-    # Now [a0, b0] contains the HPD and [a1, b1] is contained in the HPD
-    # So we apply bisection on the coverage
-    it = 0
-    stop_condition = abs(compute_coverage(a0, b0) - alpha) < tol
-    while (not stop_condition) and (it <= maxiter):
-        it += 1
-        a = (a0 + a1) / 2
-        while density(a + 1E-10) - density(a) <= 0:
-            a = (a0 + a) / 2
-        b = find_pair(a)
-        coverage = compute_coverage(a, b)
-        if coverage < alpha:
-            a1, b1 = a, b
-        if coverage > alpha:
-            a0, b0 = a, b
-        stop_condition = (abs(compute_coverage(a0, b0) - alpha) + abs(density(a0) - density(b0))) < tol
-
-    result = RootFinderResult(x=jnp.array([a0, b0]), success=None, message=None)
-    if stop_condition:
-        result.success = True
-    else:
-        result.sucess = False
-        result.message = "Maximum number of root finder iterations reached"
-
-    ic(a0)
-    ic(b0)
-    ic([compute_coverage(a0, b0) - alpha, density(b0) - density(a0)])
-
-    return result
-    
-    
 def compute_bandwidth(data: Float[Array, ""], method="rule of thumb") -> Float[Array, ""]:
     n = data.shape[0]
     if method == "rule of thumb": # Assumes kernel is gaussian
+        # sigma_iqr = (jnp.quantile(data, 0.75) - jnp.quantile(data, 0.25)) / (normal_dist.icdf(0.75) - normal_dist.icdf(0.25))
+        # sigma_hat = min(sigma_iqr, jnp.std(data))
         return jnp.power(4/3, 1/5) / jnp.power(n, 1/4) * jnp.std(data)
     
 
@@ -147,13 +69,18 @@ def empirical_Psi(
     kde: Callable[[Float[Array, ""]], Float[Array, ""]],
     phi: Callable[[Float[Array, ""]], Float[Array, ""]],
     transformed_kde: Callable[[Float[Array, ""]], Float[Array, ""]],
+    kernel_second_moment: Float[Array, ""],
     bandwidth: Float[Array, ""],
     alpha: Float[Array, ""],
 ) -> Float[Array, "2"]:
     a, b = interval[0], interval[1]
     delta_transformed_kde = transformed_kde(b) - transformed_kde(a)
+    kde_second_deriv = jax.grad(jax.grad(kde))
+    phi_grad = jax.grad(phi)
+    delta_curvature = kde_second_deriv(phi(b)) * phi_grad(b) - kde_second_deriv(phi(a)) * phi_grad(a)
     return jnp.array([
-        quadgk(kde, [phi(a), phi(b)])[0] - alpha, delta_transformed_kde
+        quadgk(kde, [phi(a), phi(b)])[0] - alpha,
+        delta_transformed_kde  # - 0.5 * kernel_second_moment * bandwidth**2 * delta_curvature
     ])
 
 
@@ -162,19 +89,23 @@ def jac_empirical_Psi(
     kde: Callable[[Float[Array, ""]], Float[Array, ""]],
     phi: Callable[[Float[Array, ""]], Float[Array, ""]],
     transformed_kde: Callable[[Float[Array, ""]], Float[Array, ""]],
+    kernel_second_moment: Float[Array, ""],
     bandwidth: Float[Array, ""],
     alpha: Float[Array, ""],
 ) -> Float[Array, "2"]:
     a, b = interval[0], interval[1]
     transformed_kde_derivative = jax.grad(transformed_kde)
+    kde_second_derivative = jax.grad(jax.grad(kde))
+    phi_grad = jax.grad(phi)
+    curvature_derivative = jax.grad(lambda x: kde_second_derivative(phi(x)) * phi_grad(x))
     result = jnp.array([
         [
             -transformed_kde(a),
             transformed_kde(b)
         ],
         [
-            -transformed_kde_derivative(a),
-            transformed_kde_derivative(b)
+            -transformed_kde_derivative(a), # + 0.5 * kernel_second_moment * bandwidth**2 * curvature_derivative(a),
+            transformed_kde_derivative(b) # - 0.5 * kernel_second_moment * bandwidth**2 * curvature_derivative(b)
         ]
     ])
     return result
@@ -187,7 +118,9 @@ def HPD_estimator_with_confidence(
     kernel: Callable[[Float[Array, "..."]], Float[Array, "..."]],
     phi: Callable[[Float[Array, "..."]], Float[Array, "..."]],
     kernel_squared_norm: Float[Array, ""],
+    kernel_second_moment: Float[Array, ""],
     x0: Float[Array, "2"] = None,
+    key: jax.random.PRNGKey = 42,
     maxiter: int = 1000,
 ) -> Float[Array, "6"]:
     n_samples = data.shape[0]
@@ -196,21 +129,20 @@ def HPD_estimator_with_confidence(
     kde_ess = n_samples * bandwidth
     kde = KDE(transformed_data, bandwidth, kernel)
     transformed_kde = TransformedKDE(kde, phi)
+    transformed_kde_deriv = jax.grad(transformed_kde)
     phi_grad = jax.grad(phi)
-    normal_dist = Normal(mu=0.0, sigma=1.0)
-    q = normal_dist.icdf((1 + beta)/2)
+    q = normal_dist.icdf((1 + jnp.sqrt(beta))/2)
 
     fun = lambda interval: empirical_Psi(
-        interval, kde, phi, transformed_kde, bandwidth, alpha
+        interval, kde, phi, transformed_kde, kernel_second_moment, bandwidth, alpha
     )
     jac = lambda interval: jac_empirical_Psi(
-        interval, kde, phi, transformed_kde, bandwidth, alpha
+        interval, kde, phi, transformed_kde, kernel_second_moment, bandwidth, alpha
     )
     if x0 is None:
         x0 = empirical_hpd(data, alpha)
     x1 = x0
     hpd_sol = None
-    key = random.key(1234)
     it = 0
     while (hpd_sol is None) and (it <= maxiter):
         it += 1
@@ -223,26 +155,39 @@ def HPD_estimator_with_confidence(
         raise Exception(f"Reached max number of tries: {maxiter}. Root finder did not converge")
     a_hat, b_hat = hpd_sol.x
 
-    transformed_kde_deriv = jax.grad(transformed_kde)
-    gamma_hat_numerator = (
-        kernel_squared_norm * (
-            transformed_kde(a_hat) * phi_grad(a_hat)
-            + transformed_kde(b_hat) * phi_grad(b_hat)
-        )
+    inv_S_n = 1 / (2 * jnp.sqrt(kde_ess)) * jnp.array([
+        [jnp.sqrt(bandwidth), 1],
+        [-jnp.sqrt(bandwidth), 1]
+    ])
+    det_psi_dot = (
+        transformed_kde(b_hat) * transformed_kde_deriv(a_hat)
+        - transformed_kde(a_hat) * transformed_kde_deriv(b_hat)
     )
-    gamma_hat_denominator = jnp.square(
-        kde(b_hat) * transformed_kde_deriv(a_hat)
-        - kde(a_hat) * transformed_kde_deriv(b_hat)
+    M_with_sqrt_bandwidth = 1 / det_psi_dot * jnp.array([
+        [transformed_kde_deriv(b_hat) - transformed_kde_deriv(a_hat), 0],
+        [jnp.sqrt(bandwidth) * (transformed_kde_deriv(b_hat) + transformed_kde_deriv(a_hat)), - (transformed_kde(b_hat) + transformed_kde(a_hat))]
+    ])
+    root_cov = jnp.sqrt(jnp.array([
+        [alpha * (1 - alpha), 0],
+        [0, kernel_squared_norm * (
+            transformed_kde(a_hat) * phi_grad(a_hat) + transformed_kde(b_hat) * phi_grad(b_hat)
+        )]
+    ]))
+    gamma = inv_S_n @ M_with_sqrt_bandwidth @ root_cov
+
+    vertices = gamma @ jnp.stack(
+        [
+            jnp.array([q, q]),
+            jnp.array([-q, q]),
+            jnp.array([q, -q]),
+            jnp.array([-q, -q])
+        ],
+        axis=1
     )
-    gamma_hat = jnp.sqrt(gamma_hat_numerator / gamma_hat_denominator)
-    a_scale = jnp.min(jnp.array([transformed_kde(b_hat), transformed_kde(a_hat)]))
-    b_scale = jnp.max(jnp.array([transformed_kde(b_hat), transformed_kde(a_hat)]))
-    a_L = a_hat - gamma_hat * a_scale / jnp.sqrt(kde_ess) * q
-    a_U = a_hat + gamma_hat * a_scale / jnp.sqrt(kde_ess) * q
-    # b_L = b_hat - gamma_hat * transformed_kde(a_hat) / jnp.sqrt(kde_ess) * q
-    # b_U = b_hat + gamma_hat * transformed_kde(a_hat) / jnp.sqrt(kde_ess) * q
-    b_L = b_hat - gamma_hat * b_scale / jnp.sqrt(kde_ess) * q
-    b_U = b_hat + gamma_hat * b_scale / jnp.sqrt(kde_ess) * q
+    a_L = a_hat + jnp.min(vertices[0, :])
+    a_U = a_hat + jnp.max(vertices[0, :])
+    b_L = b_hat + jnp.min(vertices[1, :])
+    b_U = b_hat + jnp.max(vertices[1, :])
     return jnp.array([a_hat, a_L, a_U, b_hat, b_L, b_U])
 
 
@@ -250,28 +195,28 @@ if __name__ == "__main__":
     kernel = lambda x: 1/jnp.sqrt(2*jnp.pi)*jnp.exp(-x**2/2)
     phi = lambda x: jnp.log(x)
     kernel_squared_norm = 1 / (2*jnp.sqrt(jnp.pi))
+    kernel_second_moment = 1.0
     ALPHA = 0.95
     BETA = 0.95
     SIGMA = 1
     MU = 0.0
     N_SAMPLES = int(1E3)
-    key = random.key(0)
+    key = random.key(42)
 
     def log_normal_pdf(
         x: Float[Array, ""],
     ) -> Float[Array, ""]:
         return jnp.exp(-(jnp.log(x) - MU)**2 / (2 * SIGMA**2)) / (x * SIGMA * jnp.sqrt(2*jnp.pi))
 
-    # true_hpd_sol = root(
-    #     fun=lambda x: jnp.array([quad(log_normal_pdf, x[0], x[1])[0] - ALPHA, log_normal_pdf(x[0]) - log_normal_pdf(x[1])]),
-    #     x0=[0.1, 2.0],
-    #     jac=lambda x: jnp.array([
-    #             [-log_normal_pdf(x[0]), log_normal_pdf(x[1])],
-    #             [jax.grad(log_normal_pdf)(x[0]), -jax.grad(log_normal_pdf)(x[1])]
-    #     ]),
-    #     method="hybr",
-    # )
-    true_hpd_sol = hpd_z_estimator(ALPHA, log_normal_pdf, jnp.array([0.01, 2.0]))
+    true_hpd_sol = root(
+        fun=lambda x: jnp.array([quad(log_normal_pdf, x[0], x[1])[0] - ALPHA, log_normal_pdf(x[0]) - log_normal_pdf(x[1])]),
+        x0=[0.1, 2.0],
+        jac=lambda x: jnp.array([
+                [-log_normal_pdf(x[0]), log_normal_pdf(x[1])],
+                [jax.grad(log_normal_pdf)(x[0]), -jax.grad(log_normal_pdf)(x[1])]
+        ]),
+        method="hybr",
+    )
     print(true_hpd_sol.success)
     print(true_hpd_sol.message)
     print(true_hpd_sol.x)
@@ -289,10 +234,10 @@ if __name__ == "__main__":
     transformed_kde = TransformedKDE(kde, phi)
 
     hpd_estimator = HPD_estimator_with_confidence(
-        data, ALPHA, BETA, kernel, phi, kernel_squared_norm
+        data, ALPHA, BETA, kernel, phi, kernel_squared_norm, kernel_second_moment
     )
     a_hat, a_L, a_U, b_hat, b_L, b_U = hpd_estimator
-    ic(empirical_Psi([a_hat, b_hat], kde, phi, transformed_kde, bandwidth, ALPHA))
+    ic(empirical_Psi([a_hat, b_hat], kde, phi, transformed_kde, kernel_second_moment, bandwidth, ALPHA))
     ic(a_hat)
     ic(a_L)
     ic(a_U)
