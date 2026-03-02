@@ -12,7 +12,7 @@ from scipy.integrate import quad
 from scipy.optimize import root
 from tqdm import tqdm
     
-from HPD_estimation_as_Z_estimator_modified import HPD_estimator_with_confidence
+from kde_based_estimator import HPD_estimator
 
 KERNEL = lambda x: 1/jnp.sqrt(2*jnp.pi)*jnp.exp(-x**2/2)
 PHI = lambda x: jnp.log(x)
@@ -51,7 +51,7 @@ if __name__ == "__main__":
     data = pl.read_csv("python/for_Caio.csv")
     data = jnp.array(data["x"])
     print(data.min(), data.max())
-    hpd_estimator = HPD_estimator_with_confidence(
+    hpd_estimator = HPD_estimator(
         data, ALPHA, BETA, KERNEL, PHI, KERNEL_SQUARED_NORM,
     )
     a_hat, a_L, a_U, b_hat, b_L, b_U = hpd_estimator

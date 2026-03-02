@@ -11,10 +11,7 @@ from scipy.integrate import quad
 from scipy.optimize import root
 from tqdm import tqdm
     
-# from HPD_estimation_as_Z_estimator_modified import HPD_estimator_with_confidence
-from HPD_estimation_as_multiscale_Z_estimator import HPD_estimator_with_confidence
-# from HPD_estimation_as_multiscale_Z_estimator_with_Sn import HPD_estimator_with_confidence
-# from HPD_estimation_as_multiscale_Z_estimator_with_full_covariance import HPD_estimator_with_confidence
+from python.kde_based_estimator import HPD_estimator
 
 KERNEL = lambda x: 1/jnp.sqrt(2*jnp.pi)*jnp.exp(-x**2/2)
 PHI = lambda x: jnp.log(x)
@@ -70,7 +67,7 @@ if __name__ == "__main__":
         # hpd_estimator = HPD_estimator_with_confidence(
         #     data, ALPHA, BETA, KERNEL, PHI, KERNEL_SQUARED_NORM, KERNEL_SECOND_MOMENT, key=key
         # )
-        hpd_estimator = HPD_estimator_with_confidence(
+        hpd_estimator = HPD_estimator(
             data, ALPHA, BETA, KERNEL, PHI, KERNEL_SQUARED_NORM, key=key, single_rate=True
         )
         # a_hat, a_L, a_U, b_hat, b_L, b_U = hpd_estimator
